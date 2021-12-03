@@ -1,0 +1,2 @@
+#python3 verify.py ads_int_final_dist/ nv_int_final_dist/ graph_list_int
+python3 verify.py ads_float_final_dist/ nv_float_final_dist/ graph_list_float

@@ -1,0 +1,163 @@
+diff --git a/lonestar/analytics/cpu/sssp/SSSP.cpp b/lonestar/analytics/cpu/sssp/SSSP.cpp
+index 0d05b2410..1d2d0b17b 100644
+--- a/lonestar/analytics/cpu/sssp/SSSP.cpp
++++ b/lonestar/analytics/cpu/sssp/SSSP.cpp
+@@ -93,7 +93,7 @@ using Graph = galois::graphs::LC_CSR_Graph<std::atomic<uint32_t>, uint32_t>::
+ //! [withnumaalloc]
+ typedef Graph::GraphNode GNode;
+ 
+-constexpr static const bool TRACK_WORK          = false;
++constexpr static const bool TRACK_WORK          = true;
+ constexpr static const unsigned CHUNK_SIZE      = 64U;
+ constexpr static const ptrdiff_t EDGE_TILE_SIZE = 512;
+ 
+@@ -117,12 +117,13 @@ using OBIM_Barrier =
+ 
+ template <typename T, typename OBIMTy = OBIM, typename P, typename R>
+ void deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
+-                   const R& edgeRange) {
++                   const R& edgeRange, long long int& total_work) {
+ 
+   //! [reducible for self-defined stats]
+   galois::GAccumulator<size_t> BadWork;
+   //! [reducible for self-defined stats]
+   galois::GAccumulator<size_t> WLEmptyWork;
++  galois::GAccumulator<size_t> WORK_COUNT;
+ 
+   graph.getData(source) = 0;
+ 
+@@ -140,7 +141,7 @@ void deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
+             WLEmptyWork += 1;
+           return;
+         }
+-
++        WORK_COUNT+=1;
+         for (auto ii : edgeRange(item)) {
+ 
+           GNode dst          = graph.getEdgeDst(ii);
+@@ -169,6 +170,9 @@ void deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
+     //! [report self-defined stats]
+     galois::runtime::reportStat_Single("SSSP", "WLEmptyWork",
+                                        WLEmptyWork.reduce());
++	//! [report self-defined stats]
++	galois::runtime::reportStat_Single("SSSP", "WORK_COUNT", WORK_COUNT.reduce());
++	total_work = WORK_COUNT.reduce();
+   }
+ }
+ 
+@@ -222,7 +226,7 @@ void serDeltaAlgo(Graph& graph, const GNode& source, const P& pushWrap,
+ 
+ template <typename T, typename P, typename R>
+ void dijkstraAlgo(Graph& graph, const GNode& source, const P& pushWrap,
+-                  const R& edgeRange) {
++                  const R& edgeRange, long long int& total_work) {
+ 
+   using WL = galois::MinHeap<T>;
+ 
+@@ -242,7 +246,7 @@ void dijkstraAlgo(Graph& graph, const GNode& source, const P& pushWrap,
+       // empty work
+       continue;
+     }
+-
++    total_work++;
+     for (auto e : edgeRange(item)) {
+ 
+       GNode dst   = graph.getEdgeDst(e);
+@@ -402,6 +406,7 @@ int main(int argc, char** argv) {
+   graph.getData(source) = 0;
+ 
+   std::cout << "Running " << ALGO_NAMES[algo] << " algorithm\n";
++  long long int total_work = 0;
+ 
+   galois::StatTimer autoAlgoTimer("AutoAlgo_0");
+   galois::StatTimer execTime("Timer_0");
+@@ -421,11 +426,11 @@ int main(int argc, char** argv) {
+   switch (algo) {
+   case deltaTile:
+     deltaStepAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
+-                               TileRangeFn());
++                               TileRangeFn(), total_work);
+     break;
+   case deltaStep:
+     deltaStepAlgo<UpdateRequest>(graph, source, ReqPushWrap(),
+-                                 OutEdgeRangeFn{graph});
++                                 OutEdgeRangeFn{graph}, total_work);
+     break;
+   case serDeltaTile:
+     serDeltaAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
+@@ -437,11 +442,11 @@ int main(int argc, char** argv) {
+     break;
+   case dijkstraTile:
+     dijkstraAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
+-                              TileRangeFn());
++                              TileRangeFn(), total_work);
+     break;
+   case dijkstra:
+     dijkstraAlgo<UpdateRequest>(graph, source, ReqPushWrap(),
+-                                OutEdgeRangeFn{graph});
++                                OutEdgeRangeFn{graph}, total_work);
+     break;
+   case topo:
+     topoAlgo(graph, source);
+@@ -452,7 +457,7 @@ int main(int argc, char** argv) {
+ 
+   case deltaStepBarrier:
+     deltaStepAlgo<UpdateRequest, OBIM_Barrier>(graph, source, ReqPushWrap(),
+-                                               OutEdgeRangeFn{graph});
++                                               OutEdgeRangeFn{graph}, total_work);
+     break;
+ 
+   default:
+@@ -505,5 +510,52 @@ int main(int argc, char** argv) {
+ 
+   totalTime.stop();
+ 
++	float ms_time = (float) execTime.get_usec() / (float) 1000.0;
++
++	std::cout << "total_work " << total_work << "\n";
++	std::cout << "time " << ms_time << "\n";
++
++	char short_name[256];
++	{
++		char* tmp;
++		char c_name[256];
++		strcpy(c_name, inputFile.c_str());
++		tmp = strtok(c_name, "/");
++		while (tmp != NULL) {
++			strcpy(short_name, tmp);
++			tmp = strtok(NULL, "/");
++		}
++	}
++
++
++	char file_name[256];
++	if(algo == deltaStep){
++		strcpy(file_name,"ds_int_final_dist/");
++	}else if(algo == dijkstra){
++		strcpy(file_name,"dj_int_final_dist/");
++	}else{
++		assert(false);
++	}
++	strcat(file_name,short_name);
++
++	//node data
++	FILE *fp = fopen(file_name, "w");
++
++
++	for (unsigned i = 0; i < graph.size(); i++) {
++		uint32_t dist = graph.getData(i);
++		if (dist == SSSP::DIST_INFINITY) {
++			fprintf(fp, "%d INF\n", i);
++		} else {
++			fprintf(fp, "%d %u\n", i,   dist);
++		}
++	}
++
++	FILE * d3;
++	d3 = fopen("/dev/fd/3", "a");
++	fprintf(d3, "%s %.3f %llu\n", short_name, ms_time,  total_work);
++	fclose(d3);
++
++
+   return 0;
+ }

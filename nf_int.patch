@@ -1,0 +1,394 @@
+diff --git a/libgpu/include/csr_graph.h b/libgpu/include/csr_graph.h
+index db9ccccd8..4bb9561c9 100644
+--- a/libgpu/include/csr_graph.h
++++ b/libgpu/include/csr_graph.h
+@@ -138,6 +138,7 @@ struct CSRGraph {
+   edge_data_type* edge_data;
+   node_data_type* node_data;
+   bool device_graph;
++  char file_name[256];
+ };
+ 
+ struct CSRGraphTex : CSRGraph {
+diff --git a/libgpu/include/worklist.h b/libgpu/include/worklist.h
+index 7758ca65e..2957baf37 100644
+--- a/libgpu/include/worklist.h
++++ b/libgpu/include/worklist.h
+@@ -327,7 +327,34 @@ struct Worklist {
+     return 1;
+   }
+ 
++
++  __device__ __forceinline__ unsigned find_nth_bit(uint bit_mask, uint base,
++  		uint offset) {
++  	uint ret_val;
++  	asm volatile (
++  			"fns.b32 %0, %1, %2, %3;"
++  			: "=r" (ret_val) :"r" (bit_mask), "r"(base), "r" (offset)
++  	);
++  	return ret_val;
++  }
++
++
+   __device__ int setup_push_warp_one() {
++
++	int lindex = 0;
++	uint a_mask = __activemask();
++	uint count = __popc(a_mask);
++	uint offset = __popc(a_mask & cub::LaneMaskLt());
++	uint leader = find_nth_bit(a_mask, 0, 1);
++	if (offset == 0) {
++		lindex = atomicAdd((int *) dindex, count);
++	}
++
++	lindex = __shfl_sync(a_mask, lindex, leader);
++	return lindex + offset;
++
++
++	/*
+     int first, total, offset, lindex = 0;
+ 
+     warp_active_count(first, offset, total);
+@@ -346,6 +373,7 @@ struct Worklist {
+     // lindex = cub::ShuffleIndex(lindex, first); // CUB > 1.3.1
+ 
+     return lindex + offset;
++    	*/
+   }
+ 
+   __device__ int setup_push_warp_one_za() {
+diff --git a/libgpu/src/csr_graph.cu b/libgpu/src/csr_graph.cu
+index 8cb63eaeb..87104075f 100644
+--- a/libgpu/src/csr_graph.cu
++++ b/libgpu/src/csr_graph.cu
+@@ -257,6 +257,14 @@ unsigned CSRGraph::readFromGR(char file[], bool read_edge_data) {
+   printf("read %lld bytes in %d ms (%0.2f MB/s)\n\r\n", masterLength,
+          t.duration_ms(), (masterLength / 1000.0) / (t.duration_ms()));
+ 
++	char* tmp;
++	tmp = strtok(file, "/");
++	while (tmp != NULL) {
++		strcpy(file_name, tmp);
++		tmp = strtok(NULL, "/");
++	}
++
++
+   return 0;
+ }
+ 
+diff --git a/lonestar/analytics/gpu/sssp/sssp.cu b/lonestar/analytics/gpu/sssp/sssp.cu
+index cdd89d424..cabe64f67 100644
+--- a/lonestar/analytics/gpu/sssp/sssp.cu
++++ b/lonestar/analytics/gpu/sssp/sssp.cu
+@@ -9,7 +9,6 @@ void kernel_sizing(CSRGraph &, dim3 &, dim3 &);
+ #define TB_SIZE 256
+ const char *GGC_OPTIONS = "coop_conv=False $ outline_iterate_gb=True $ backoff_blocking_factor=4 $ parcomb=True $ np_schedulers=set(['fg', 'wp']) $ cc_disable=set([]) $ tb_lb=True $ hacks=set([]) $ np_factor=8 $ instrument=set([]) $ unroll=[] $ read_props=None $ outline_iterate=True $ ignore_nested_errors=False $ np=True $ write_props=None $ quiet_cgen=True $ retry_backoff=True $ cuda.graph_type=basic $ cuda.use_worklist_slots=True $ cuda.worklist_type=basic";
+ struct ThreadWork t_work;
+-extern int DELTA;
+ extern int start_node;
+ bool enable_lb = false;
+ typedef int edge_data_type;
+@@ -167,7 +166,8 @@ __global__ void Inspect_sssp_kernel_dev(CSRGraph graph, int delta, PipeContextT<
+     }
+   }
+ }
+-__device__ void sssp_kernel_dev(CSRGraph graph, int delta, bool enable_lb, Worklist2 in_wl, Worklist2 out_wl, Worklist2 re_wl)
++__device__ void sssp_kernel_dev(CSRGraph graph, int delta, bool enable_lb, Worklist2 in_wl, Worklist2 out_wl, Worklist2 re_wl,
++		unsigned* work_count)
+ {
+   unsigned tid = TID_1D;
+   unsigned nthreads = TOTAL_THREADS_1D;
+@@ -181,6 +181,7 @@ __device__ void sssp_kernel_dev(CSRGraph graph, int delta, bool enable_lb, Workl
+   typedef cub::BlockScan<multiple_sum<2, index_type>, BLKSIZE> BlockScan;
+   typedef union np_shared<BlockScan::TempStorage, index_type, struct empty_np, struct warp_np<__kernel_tb_size/32>, struct fg_np<ITSIZE> > npsTy;
+ 
++  unsigned m_work_count = 0;
+   __shared__ npsTy nps ;
+   wlnode_end = roundup((*((volatile index_type *) (in_wl).dindex)), (blockDim.x));
+   for (index_type wlnode = 0 + tid; wlnode < wlnode_end; wlnode += nthreads)
+@@ -198,6 +199,7 @@ __device__ void sssp_kernel_dev(CSRGraph graph, int delta, bool enable_lb, Workl
+     {
+       _np.size = (graph).getOutDegree(node);
+       _np.start = (graph).getFirstEdge(node);
++      m_work_count++;
+     }
+     _np_mps.el[0] = _np.size >= _NP_CROSSOVER_WP ? _np.size : 0;
+     _np_mps.el[1] = _np.size < _NP_CROSSOVER_WP ? _np.size : 0;
+@@ -294,17 +296,20 @@ __device__ void sssp_kernel_dev(CSRGraph graph, int delta, bool enable_lb, Workl
+     assert(threadIdx.x < __kernel_tb_size);
+     node = _np_closure[threadIdx.x].node;
+   }
++  if (m_work_count > 0) {
++  	work_count[tid] += m_work_count;
++  }
+ }
+-__global__ void __launch_bounds__(TB_SIZE, 2) sssp_kernel(CSRGraph graph, int delta, bool enable_lb, Worklist2 in_wl, Worklist2 out_wl, Worklist2 re_wl)
++__global__ void __launch_bounds__(TB_SIZE, 2) sssp_kernel(CSRGraph graph, int delta, bool enable_lb, Worklist2 in_wl, Worklist2 out_wl, Worklist2 re_wl, unsigned* work_count)
+ {
+   unsigned tid = TID_1D;
+ 
+   if (tid == 0)
+     in_wl.reset_next_slot();
+ 
+-  sssp_kernel_dev(graph, delta, enable_lb, in_wl, out_wl, re_wl);
++  sssp_kernel_dev(graph, delta, enable_lb, in_wl, out_wl, re_wl, work_count);
+ }
+-void gg_main_pipe_1(CSRGraph& gg, gint_p glevel, int& curdelta, int& i, int DELTA, GlobalBarrier& remove_dups_barrier, int remove_dups_blocks, PipeContextT<Worklist2>& pipe, dim3& blocks, dim3& threads)
++void gg_main_pipe_1(CSRGraph& gg, gint_p glevel, int& curdelta, int& i, int DELTA, GlobalBarrier& remove_dups_barrier, int remove_dups_blocks, PipeContextT<Worklist2>& pipe, dim3& blocks, dim3& threads, unsigned* work_count)
+ {
+   while (pipe.in_wl().nitems())
+   {
+@@ -326,7 +331,7 @@ void gg_main_pipe_1(CSRGraph& gg, gint_p glevel, int& curdelta, int& i, int DELT
+           cudaDeviceSynchronize();
+         }
+       }
+-      sssp_kernel <<<blocks, __tb_sssp_kernel>>>(gg, curdelta, enable_lb, pipe.in_wl(), pipe.out_wl(), pipe.re_wl());
++      sssp_kernel <<<blocks, __tb_sssp_kernel>>>(gg, curdelta, enable_lb, pipe.in_wl(), pipe.out_wl(), pipe.re_wl(), work_count);
+       cudaDeviceSynchronize();
+       pipe.in_wl().swap_slots();
+       pipe.retry2();
+@@ -341,7 +346,7 @@ void gg_main_pipe_1(CSRGraph& gg, gint_p glevel, int& curdelta, int& i, int DELT
+     curdelta += DELTA;
+   }
+ }
+-__global__ void __launch_bounds__(__tb_gg_main_pipe_1_gpu_gb) gg_main_pipe_1_gpu_gb(CSRGraph gg, gint_p glevel, int curdelta, int i, int DELTA, GlobalBarrier remove_dups_barrier, int remove_dups_blocks, PipeContextT<Worklist2> pipe, int* cl_curdelta, int* cl_i, bool enable_lb, GlobalBarrier gb)
++__global__ void __launch_bounds__(__tb_gg_main_pipe_1_gpu_gb) gg_main_pipe_1_gpu_gb(CSRGraph gg, gint_p glevel, int curdelta, int i, int DELTA, GlobalBarrier remove_dups_barrier, int remove_dups_blocks, PipeContextT<Worklist2> pipe, int* cl_curdelta, int* cl_i, bool enable_lb, GlobalBarrier gb, unsigned* work_count)
+ {
+   unsigned tid = TID_1D;
+ 
+@@ -353,7 +358,7 @@ __global__ void __launch_bounds__(__tb_gg_main_pipe_1_gpu_gb) gg_main_pipe_1_gpu
+     {
+       if (tid == 0)
+         pipe.in_wl().reset_next_slot();
+-      sssp_kernel_dev (gg, curdelta, enable_lb, pipe.in_wl(), pipe.out_wl(), pipe.re_wl());
++      sssp_kernel_dev (gg, curdelta, enable_lb, pipe.in_wl(), pipe.out_wl(), pipe.re_wl(), work_count);
+       pipe.in_wl().swap_slots();
+       gb.Sync();
+       pipe.retry2();
+@@ -376,7 +381,67 @@ __global__ void __launch_bounds__(__tb_gg_main_pipe_1_gpu_gb) gg_main_pipe_1_gpu
+     *cl_i = i;
+   }
+ }
+-void gg_main_pipe_1_wrapper(CSRGraph& gg, gint_p glevel, int& curdelta, int& i, int DELTA, GlobalBarrier& remove_dups_barrier, int remove_dups_blocks, PipeContextT<Worklist2>& pipe, dim3& blocks, dim3& threads)
++
++#define I_TIME 4
++#define N_TIME 2
++	__global__ void profiler_kernel(CSRGraph gg, float* bk_degree, float* bk_wt,
++			int warp_node_interval, int warp_edge_interval) {
++
++		int tid = TID_1D;
++		int warp_id = tid / 32;
++		int num_warp = TOTAL_THREADS_1D / 32;
++
++		typedef cub::BlockReduce<float, 1024> BlockReduce;
++		__shared__ typename BlockReduce::TempStorage temp_storage;
++		float thread_data[I_TIME];
++		float tb_ave = 0;
++		//find ave degree
++		for (int n = 0; n < N_TIME; n++) {
++			for (int i = 0; i < I_TIME; i++) {
++				unsigned warp_offset = ((n * I_TIME + i) * num_warp + warp_id)
++						* warp_node_interval;
++				unsigned node_id = warp_offset + cub::LaneId();
++				if (node_id < gg.nnodes) {
++					thread_data[i] = (float) gg.getOutDegree(node_id);
++				} else {
++					thread_data[i] = 0;
++				}
++			}
++			//do a reduction
++			float sum = BlockReduce(temp_storage).Sum(thread_data);
++			tb_ave += (sum / 1024 / I_TIME);
++		}
++		tb_ave = tb_ave / N_TIME;
++		//store it back
++		if (threadIdx.x == 0) {
++			bk_degree[blockIdx.x] = tb_ave;
++		}
++
++		//find ave weight
++		tb_ave = 0;
++		for (int n = 0; n < N_TIME; n++) {
++			for (int i = 0; i < I_TIME; i++) {
++				unsigned warp_offset = ((n * I_TIME + i) * num_warp + warp_id)
++						* warp_edge_interval;
++				unsigned edge_id = warp_offset + cub::LaneId();
++				if (edge_id < gg.nedges) {
++					thread_data[i] = (float) gg.edge_data[edge_id];
++				} else {
++					thread_data[i] = 0;
++				}
++			}
++			//do a reduction
++			float sum = BlockReduce(temp_storage).Sum(thread_data);
++			tb_ave += (sum / 1024 / I_TIME);
++		}
++		tb_ave = tb_ave / N_TIME;
++		//store it back
++		if (threadIdx.x == 0) {
++			bk_wt[blockIdx.x] = tb_ave;
++		}
++	}
++
++void gg_main_pipe_1_wrapper(CSRGraph& gg, gint_p glevel, int& curdelta, int& i, int DELTA, GlobalBarrier& remove_dups_barrier, int remove_dups_blocks, PipeContextT<Worklist2>& pipe, dim3& blocks, dim3& threads, unsigned* work_count)
+ {
+   static GlobalBarrierLifetime gg_main_pipe_1_gpu_gb_barrier;
+   static bool gg_main_pipe_1_gpu_gb_barrier_inited;
+@@ -386,7 +451,7 @@ void gg_main_pipe_1_wrapper(CSRGraph& gg, gint_p glevel, int& curdelta, int& i,
+   if(!gg_main_pipe_1_gpu_gb_barrier_inited) { gg_main_pipe_1_gpu_gb_barrier.Setup(gg_main_pipe_1_gpu_gb_blocks); gg_main_pipe_1_gpu_gb_barrier_inited = true;};
+   if (enable_lb)
+   {
+-    gg_main_pipe_1(gg,glevel,curdelta,i,DELTA,remove_dups_barrier,remove_dups_blocks,pipe,blocks,threads);
++    gg_main_pipe_1(gg,glevel,curdelta,i,DELTA,remove_dups_barrier,remove_dups_blocks,pipe,blocks,threads, work_count);
+   }
+   else
+   {
+@@ -397,7 +462,7 @@ void gg_main_pipe_1_wrapper(CSRGraph& gg, gint_p glevel, int& curdelta, int& i,
+     check_cuda(cudaMemcpy(cl_curdelta, &curdelta, sizeof(int) * 1, cudaMemcpyHostToDevice));
+     check_cuda(cudaMemcpy(cl_i, &i, sizeof(int) * 1, cudaMemcpyHostToDevice));
+ 
+-    gg_main_pipe_1_gpu_gb<<<gg_main_pipe_1_gpu_gb_blocks, __tb_gg_main_pipe_1_gpu_gb>>>(gg,glevel,curdelta,i,DELTA,remove_dups_barrier,remove_dups_blocks,pipe,cl_curdelta,cl_i, enable_lb, gg_main_pipe_1_gpu_gb_barrier);
++    gg_main_pipe_1_gpu_gb<<<gg_main_pipe_1_gpu_gb_blocks, __tb_gg_main_pipe_1_gpu_gb>>>(gg,glevel,curdelta,i,DELTA,remove_dups_barrier,remove_dups_blocks,pipe,cl_curdelta,cl_i, enable_lb, gg_main_pipe_1_gpu_gb_barrier, work_count);
+     check_cuda(cudaMemcpy(&curdelta, cl_curdelta, sizeof(int) * 1, cudaMemcpyDeviceToHost));
+     check_cuda(cudaMemcpy(&i, cl_i, sizeof(int) * 1, cudaMemcpyDeviceToHost));
+     check_cuda(cudaFree(cl_curdelta));
+@@ -415,6 +480,20 @@ void gg_main(CSRGraph& hg, CSRGraph& gg)
+   PipeContextT<Worklist2> pipe;
+   Shared<int> level (hg.nnodes);
+   level.cpu_wr_ptr();
++
++  pipe = PipeContextT<Worklist2>(gg.nedges*2);
++
++  float ave_degree;
++  float ave_wt;
++  int num_tb = blocks.x;
++  int num_threads = threads.x;
++  unsigned* work_count;
++  cudaMalloc((void **) &work_count,num_tb * num_threads * sizeof(unsigned));
++
++#define RUN_LOOP 8
++  unsigned long long agg_total_work = 0;
++  float agg_time = 0;
++  for (int loop = 0; loop < RUN_LOOP; loop++) {
+   static const size_t remove_dups_residency = maximum_residency(remove_dups, __tb_remove_dups, 0);
+   static const size_t remove_dups_blocks = GG_MIN(blocks.x, ggc_get_nSM() * remove_dups_residency);
+   if(!remove_dups_barrier_inited) { remove_dups_barrier.Setup(remove_dups_blocks); remove_dups_barrier_inited = true;};
+@@ -422,11 +501,90 @@ void gg_main(CSRGraph& hg, CSRGraph& gg)
+   cudaDeviceSynchronize();
+   int i = 0;
+   int curdelta = 0;
+-  printf("delta: %d\n", DELTA);
+   glevel = level.gpu_wr_ptr();
+-  pipe = PipeContextT<Worklist2>(gg.nedges*2);
++
+   pipe.in_wl().wl[0] = start_node;
+   pipe.in_wl().update_gpu(1);
+-  gg_main_pipe_1_wrapper(gg,glevel,curdelta,i,DELTA,remove_dups_barrier,remove_dups_blocks,pipe,blocks,threads);
++
++
++	float elapsed_time;   // timing variables
++	cudaEvent_t start_event, stop_event;
++	cudaEventCreate(&start_event);
++	cudaEventCreate(&stop_event);
++	cudaEventRecord(start_event, 0);
++
++	node_data_type DELTA;
++	//find delta
++	int a;
++	cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a,
++			profiler_kernel, 1024, 0);
++	int profiler_tb = ggc_get_nSM() * a;
++	int total_warp = profiler_tb * 1024 / 32;
++	int warp_node_interval = hg.nnodes
++			/ (total_warp * I_TIME * N_TIME);
++	int warp_edge_interval = hg.nedges
++			/ (total_warp * I_TIME * N_TIME);
++
++	float* host_bk_degree = (float*) malloc(
++			profiler_tb * sizeof(float));
++	float* host_bk_wt = (float*) malloc(
++			profiler_tb * sizeof(float));
++	float* bk_degree;
++	cudaMalloc((void **) &bk_degree, profiler_tb * sizeof(float));
++	float* bk_wt;
++	cudaMalloc((void **) &bk_wt, profiler_tb * sizeof(float));
++	profiler_kernel<<<profiler_tb, 1024>>>(gg, bk_degree, bk_wt,
++			warp_node_interval, warp_edge_interval);
++
++	cudaMemcpy(host_bk_degree, bk_degree,
++			profiler_tb * sizeof(float), cudaMemcpyDeviceToHost);
++	cudaMemcpy(host_bk_wt, bk_wt, profiler_tb * sizeof(float),
++			cudaMemcpyDeviceToHost);
++
++	ave_degree = 0;
++	for (int i = 0; i < profiler_tb; i++) {
++		ave_degree += host_bk_degree[i];
++	}
++	ave_degree /= profiler_tb;
++
++	ave_wt = 0;
++	for (int i = 0; i < profiler_tb; i++) {
++		ave_wt += host_bk_wt[i];
++	}
++	ave_wt /= profiler_tb;
++	DELTA = (node_data_type) (32 * ave_wt / ave_degree);
++
++
++
++  gg_main_pipe_1_wrapper(gg,glevel,curdelta,i,DELTA,remove_dups_barrier,remove_dups_blocks,pipe,blocks,threads, work_count);
++	cudaEventRecord(stop_event, 0);
++	cudaEventSynchronize(stop_event);
++	cudaEventElapsedTime(&elapsed_time, start_event, stop_event);
++
+   printf("iterations: %d\n", i);
++
++
++	unsigned* work_count_host = (unsigned*) malloc(
++			num_tb * num_threads * sizeof(unsigned));
++
++	cudaMemcpy(work_count_host, work_count,
++			num_tb * num_threads * sizeof(unsigned),
++			cudaMemcpyDeviceToHost);
++	unsigned long long total_work = 0;
++	for (int i = 0; i < num_tb * num_threads; i++) {
++		total_work += work_count_host[i];
++	}
++	std::cout << hg.file_name << " ad " << ave_degree << " aw "
++			<< ave_wt << " delta " << DELTA << " w " << total_work
++			<< " t " << elapsed_time << "\n";
++	agg_time += elapsed_time;
++	agg_total_work += total_work;
++
++
++  }
++
++	FILE * d3;
++	d3 = fopen("/dev/fd/3", "a");
++	fprintf(d3, "%s %.3f %llu\n", hg.file_name, (agg_time / RUN_LOOP), (agg_total_work / RUN_LOOP));
++	fclose(d3);
+ }
+diff --git a/lonestar/analytics/gpu/sssp/support.cu b/lonestar/analytics/gpu/sssp/support.cu
+index 6dd709d75..17cf876b4 100644
+--- a/lonestar/analytics/gpu/sssp/support.cu
++++ b/lonestar/analytics/gpu/sssp/support.cu
+@@ -42,14 +42,12 @@ void output(CSRGraphTy &g, const char *output_file) {
+   else
+     f = fopen(output_file, "w");
+     
+-  const uint32_t infinity = std::numeric_limits<uint32_t>::max() / 4;    
+-  for(int i = 0; i < g.nnodes; i++) {
+-    if(g.node_data[i] == INF) {
+-      //formatting the output to be compatible with the distributed bfs ouput 
+-      check_fprintf(f, "%d %d\n", i, infinity);
+-    } else {
+-      check_fprintf(f, "%d %d\n", i, g.node_data[i]);
+-    }
++for(int i = 0; i < g.nnodes; i++) {
++  if(g.node_data[i] == INF) {
++	check_fprintf(f, "%d INF\n", i);
++  } else {
++	check_fprintf(f, "%d %d\n", i, g.node_data[i]);
+   }
++}
+ 
+ }
