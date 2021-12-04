@@ -10,7 +10,7 @@
 #include "support.h"
 #include "wl.h"
 
-#define TB_SIZE 768
+#define TB_SIZE 448		// decreased to match __launch_bounds__
 int CUDA_DEVICE = 0;
 int start_node = 0;
 char *INPUT, *OUTPUT;
@@ -22,7 +22,7 @@ __global__ void kernel(CSRGraph graph, int src) {
 	index_type node_end;
 	node_end = (graph).nnodes;
 	for (index_type node = 0 + tid; node < node_end; node += nthreads) {
-		graph.node_data[node] = (node == src) ? 0 : INF;
+		graph.node_data[node] = (node == src) ? node_data_type{node, 0.f} : INF;
 	}
 }
 #define HOR_EDGE 16
@@ -56,7 +56,8 @@ sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count) {
 			if (m_vertex < graph.nnodes) {
 				m_first_edge = graph.row_start[m_vertex];
 				m_size = graph.row_start[m_vertex + 1] - m_first_edge;
-				total_work++;
+				// count number of edges for TEPS instead of vertices
+				total_work += m_size;
 			}
 		}
 
@@ -78,7 +79,7 @@ sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count) {
 				index_type edge = leader_first_edge + offset;
 				index_type dst = graph.edge_dst[edge];
 				edge_data_type wt = graph.edge_data[edge];
-				node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[leader_vertex])) + wt;
+				node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[leader_vertex])) + node_data_type{dst, wt};
 				node_data_type dst_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[dst]));
 				if (dst_dist > new_dist) {
 					if (atomicMin_float(&(graph.node_data[dst]), new_dist) > new_dist) {
@@ -120,7 +121,7 @@ sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count) {
 				index_type edge = leader_first_edge + offset;
 				index_type dst = graph.edge_dst[edge];
 				edge_data_type wt = graph.edge_data[edge];
-				node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[leader_vertex])) + wt;
+				node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[leader_vertex])) + node_data_type{dst, wt};
 				node_data_type dst_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[dst]));
 				if (dst_dist > new_dist) {
 					if (atomicMin_float(&(graph.node_data[dst]), new_dist) > new_dist) {
@@ -221,7 +222,7 @@ void gg_main(CSRGraph& hg, CSRGraph& gg) {
 	unsigned* work_count;
 	cudaMalloc((void **) &work_count, num_tb * num_threads * sizeof(unsigned));
 
-#define RUN_LOOP 8
+#define RUN_LOOP 1	// we will run 64 start nodes, once per start node
 
 
 	worklist wl;

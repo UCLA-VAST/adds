@@ -19,19 +19,54 @@
 #include <float.h>
 typedef unsigned index_type; // should be size_t, but GPU chokes on size_t
 typedef float edge_data_type;
-typedef float node_data_type;
-#define INF (FLT_MAX)
 
-__device__ static float atomicMin_float(float* addr, float val) {
-  int* addr_as_int = (int*)addr;
-  int old = *addr_as_int;
-  int expected;
+struct SSSP_Data {
+  index_type parent;
+  edge_data_type dist;
+
+  __device__ __host__ bool operator<(SSSP_Data other) const { return dist < other.dist; }
+  __device__ __host__ bool operator>(SSSP_Data other) const { return dist > other.dist; }
+  __device__ __host__ bool operator<=(SSSP_Data other) const { return dist <= other.dist; }
+  __device__ __host__ bool operator>=(SSSP_Data other) const { return dist >= other.dist; }
+  __device__ __host__ bool operator==(SSSP_Data other) const { return dist == other.dist; }
+  __device__ __host__ bool operator!=(SSSP_Data other) const { return dist != other.dist; }
+
+  __device__ SSSP_Data operator+(const SSSP_Data& other) const {
+    return {other.parent, dist + other.dist};
+  }
+
+  __device__ SSSP_Data min(const SSSP_Data& other) const {
+    return *this < other ? *this : other;
+  }
+
+  friend std::ostream& operator<<(std::ostream& os, SSSP_Data dist) {
+    return os << "{distance=" << dist.dist << ",parent=" << dist.parent << "}";
+  }
+};
+
+typedef SSSP_Data node_data_type;
+
+#define INF node_data_type{index_type(-1), FLT_MAX}
+
+template <typename To, typename From>
+__device__ inline To bit_cast(From from) {
+  To to;
+  memcpy(&to, &from, sizeof(from));
+  return to;
+}
+
+__device__ static node_data_type atomicMin_float(node_data_type* addr, node_data_type val) {
+  using bits = unsigned long long;
+  bits* addr_as_bits = (bits*)addr;
+  bits old = *addr_as_bits;
+  bits expected;
   do {
     expected = old;
-    old = ::atomicCAS(addr_as_int, expected,
-                      __float_as_int(::fminf(val, __int_as_float(expected))));
+    // CUDA uses little-endian
+    old = ::atomicCAS(addr_as_bits, expected,
+                      bit_cast<bits>(val.min(bit_cast<node_data_type>(expected))));
   } while (expected != old);
-  return __int_as_float(old);
+  return bit_cast<node_data_type>(old);
 }
 
 
@@ -130,7 +165,7 @@ struct CSRGraphTex: CSRGraph {
 	;
 
 	__device__ node_data_type node_data_ro(index_type node) {
-		return tex1Dfetch < node_data_type > (node_data_tx, node);
+    return bit_cast<node_data_type>(tex1Dfetch<float2>(node_data_tx, node));
 	}
 
 	__device__  __host__ index_type getDestination(unsigned src, unsigned edge) {

@@ -13,7 +13,7 @@
 #define BIT_CACHE_SIZE (2048)
 #define PRE_ALLOC_DIST (4)
 #define PREFETCH_DIST (1)
-#define MAX_TB 128
+#define MAX_TB 256	// increased to use more SMs
 #define QUAN_SHIFT 22
 #define INIT_FACTOR 32
 #define FIXED_SHIFT 9
@@ -1570,7 +1570,7 @@ __device__ void worklist::tb_coop_process(CSRGraph& graph, int warp_id) {
 			index_type edge = edge_start + offset;
 			index_type dst = graph.edge_dst[edge];
 			edge_data_type wt = graph.edge_data[edge];
-			node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[vertex_id])) + wt;
+			node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[vertex_id])) + node_data_type{dst, wt};
 			node_data_type dst_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[dst]));
 			if (dst_dist > new_dist) {
 				if (atomicMin_float(&(graph.node_data[dst]), new_dist) > new_dist) {
@@ -1918,7 +1918,7 @@ __device__ __forceinline__ unsigned worklist::dist_to_bag_id_int(unsigned bag_id
 	unsigned cur_bag = bfg_get_bag(delta_info);
 	int cur_dist_shift = bfg_get_dist(delta_info);
 
-	int dst_dist_shift = ((int) (dst_dist / quantum)) >> delta;
+	int dst_dist_shift = ((int) (dst_dist.dist / quantum)) >> delta;
 	int bag_offset = max(0, dst_dist_shift - cur_dist_shift);	//clip to 0
 	bag_offset = min(NUM_BAG - 1, bag_offset);	//clip to NUM_BAG-1
 	if ((bag_offset == 0) && (cur_bag != bag_id)) {
